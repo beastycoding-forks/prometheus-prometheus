@@ -281,7 +281,7 @@ func (*evalCmd) testCmd()  {}
 type loadCmd struct {
 	gap       time.Duration
 	metrics   map[uint64]labels.Labels
-	defs      map[uint64][]Point
+	defs      map[uint64][]FPoint
 	exemplars map[uint64][]exemplar.Exemplar
 }
 

@@ -54,9 +54,9 @@ type FunctionCall func(vals []parser.Value, args parser.Expressions, enh *EvalNo
 
 // === time() float64 ===
 func funcTime(vals []parser.Value, args parser.Expressions, enh *EvalNodeHelper) Vector {
-	return Vector{Sample{Point: Point{
-		V: float64(enh.Ts) / 1000,
-	}}}
+	return Vector{Sample{
+		F: float64(enh.Ts) / 1000,
+	}}
 }
 
 // extrapolatedRate is a utility function for rate/increase/delta.
@@ -67,65 +67,71 @@ func extrapolatedRate(vals []parser.Value, args parser.Expressions, enh *EvalNod
 	ms := args[0].(*parser.MatrixSelector)
 	vs := ms.VectorSelector.(*parser.VectorSelector)
 	var (
-		samples         = vals[0].(Matrix)[0]
-		rangeStart      = enh.Ts - durationMilliseconds(ms.Range+vs.Offset)
-		rangeEnd        = enh.Ts - durationMilliseconds(vs.Offset)
-		resultValue     float64
-		resultHistogram *histogram.FloatHistogram
+		samples            = vals[0].(Matrix)[0]
+		rangeStart         = enh.Ts - durationMilliseconds(ms.Range+vs.Offset)
+		rangeEnd           = enh.Ts - durationMilliseconds(vs.Offset)
+		resultValue        float64
+		resultHistogram    *histogram.FloatHistogram
+		firstT, lastT      int64
+		numSamplesMinusOne int
 	)
 
-	// No sense in trying to compute a rate without at least two points. Drop
-	// this Vector element.
-	if len(samples.Points) < 2 {
+	// We need either at least two Histograms and no Floats, or at least two
+	// Floats and no Histograms to calculate a rate. Otherwise, drop this
+	// Vector element.
+	if len(samples.Histograms) > 0 && len(samples.Floats) > 0 {
+		// Mix of histograms and floats. TODO(beorn7): Communicate this failure reason.
 		return enh.Out
 	}
 
-	if samples.Points[0].H != nil {
-		resultHistogram = histogramRate(samples.Points, isCounter)
+	switch {
+	case len(samples.Histograms) > 1:
+		numSamplesMinusOne = len(samples.Histograms) - 1
+		firstT = samples.Histograms[0].T
+		lastT = samples.Histograms[numSamplesMinusOne].T
+		resultHistogram = histogramRate(samples.Histograms, isCounter)
 		if resultHistogram == nil {
-			// Points are a mix of floats and histograms, or the histograms
-			// are not compatible with each other.
-			// TODO(beorn7): find a way of communicating the exact reason
+			// The histograms are not compatible with each other.
+			// TODO(beorn7): Communicate this failure reason.
 			return enh.Out
 		}
-	} else {
-		resultValue = samples.Points[len(samples.Points)-1].V - samples.Points[0].V
-		prevValue := samples.Points[0].V
-		// We have to iterate through everything even in the non-counter
-		// case because we have to check that everything is a float.
-		// TODO(beorn7): Find a way to check that earlier, e.g. by
-		// handing in a []FloatPoint and a []HistogramPoint separately.
-		for _, currPoint := range samples.Points[1:] {
-			if currPoint.H != nil {
-				return nil // Range contains a mix of histograms and floats.
-			}
-			if !isCounter {
-				continue
-			}
-			if currPoint.V < prevValue {
+	case len(samples.Floats) > 1:
+		numSamplesMinusOne = len(samples.Floats) - 1
+		firstT = samples.Floats[0].T
+		lastT = samples.Floats[numSamplesMinusOne].T
+		resultValue = samples.Floats[numSamplesMinusOne].F - samples.Floats[0].F
+		if !isCounter {
+			break
+		}
+		// Handle counter resets:
+		prevValue := samples.Floats[0].F
+		for _, currPoint := range samples.Floats[1:] {
+			if currPoint.F < prevValue {
 				resultValue += prevValue
 			}
-			prevValue = currPoint.V
+			prevValue = currPoint.F
 		}
+	default:
+		// Not enough samples. TODO(beorn7): Communicate this failure reason.
+		return enh.Out
 	}
 
 	// Duration between first/last samples and boundary of range.
-	durationToStart := float64(samples.Points[0].T-rangeStart) / 1000
-	durationToEnd := float64(rangeEnd-samples.Points[len(samples.Points)-1].T) / 1000
+	durationToStart := float64(firstT-rangeStart) / 1000
+	durationToEnd := float64(rangeEnd-lastT) / 1000
 
-	sampledInterval := float64(samples.Points[len(samples.Points)-1].T-samples.Points[0].T) / 1000
-	averageDurationBetweenSamples := sampledInterval / float64(len(samples.Points)-1)
+	sampledInterval := float64(lastT-firstT) / 1000
+	averageDurationBetweenSamples := sampledInterval / float64(numSamplesMinusOne)
 
 	// TODO(beorn7): Do this for histograms, too.
-	if isCounter && resultValue > 0 && samples.Points[0].V >= 0 {
-		// Counters cannot be negative. If we have any slope at
-		// all (i.e. resultValue went up), we can extrapolate
-		// the zero point of the counter. If the duration to the
-		// zero point is shorter than the durationToStart, we
-		// take the zero point as the start of the series,
-		// thereby avoiding extrapolation to negative counter
-		// values.
-		durationToZero := sampledInterval * (samples.Points[0].V / resultValue)
+	if isCounter && resultValue > 0 && len(samples.Floats) > 0 && samples.Floats[0].F >= 0 {
+		// Counters cannot be negative. If we have any slope at all
+		// (i.e. resultValue went up), we can extrapolate the zero point
+		// of the counter. If the duration to the zero point is shorter
+		// than the durationToStart, we take the zero point as the start
+		// of the series, thereby avoiding extrapolation to negative
+		// counter values.
+		durationToZero := sampledInterval * (samples.Floats[0].F / resultValue)
 		if durationToZero < durationToStart {
 			durationToStart = durationToZero
 		}
@@ -158,16 +164,14 @@ func extrapolatedRate(vals []parser.Value, args parser.Expressions, enh *EvalNod
 		resultHistogram.Scale(factor)
 	}
 
-	return append(enh.Out, Sample{
-		Point: Point{V: resultValue, H: resultHistogram},
-	})
+	return append(enh.Out, Sample{F: resultValue, H: resultHistogram})
 }
 
 // histogramRate is a helper function for extrapolatedRate. It requires
 // points[0] to be a histogram. It returns nil if any other Point in points is
 // not a histogram.
-func histogramRate(points []Point, isCounter bool) *histogram.FloatHistogram {
-	prev := points[0].H // We already know that this is a histogram.
+func histogramRate(points []HPoint, isCounter bool) *histogram.FloatHistogram {
+	prev := points[0].H
 	last := points[len(points)-1].H
 	if last == nil {
 		return nil // Range contains a mix of histograms and floats.
